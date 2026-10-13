@@ -71,21 +71,66 @@ def forecast_next(art, log_returns, model_name):
     return vol, var, cond
 
 
-def fetch_new_returns(art):
+@st.cache_data(ttl=3600, show_spinner="Mengambil data terbaru dari yfinance...")
+def fetch_new_close(ticker, start):
     import yfinance as yf
 
-    base_close = art["data"]["Close"]
-    last_date = base_close.index[-1]
-    start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    raw = yf.download(art["meta"]["ticker"], start=start, progress=False)
+    raw = yf.download(ticker, start=start, progress=False)
     if raw is None or len(raw) == 0:
         return pd.Series(dtype=float)
-    new_close = pd.Series(np.asarray(raw["Close"]).ravel(), index=pd.DatetimeIndex(raw.index)).dropna()
-    new_close = new_close[new_close.index > last_date]
-    if new_close.empty:
-        return pd.Series(dtype=float)
-    chain = pd.concat([base_close.iloc[-1:], new_close])
-    return np.log(chain / chain.shift(1)).dropna()
+    return pd.Series(np.asarray(raw["Close"]).ravel(), index=pd.DatetimeIndex(raw.index)).dropna()
+
+
+def build_returns(art, use_live):
+    # gabungkan snapshot + data baru yfinance. Return (log_return, pesan_error_atau_None)
+    base = art["data"]["log_return"]
+    base_close = art["data"]["Close"]
+    if not use_live:
+        return base, None
+    try:
+        last = base_close.index[-1]
+        new_close = fetch_new_close(art["meta"]["ticker"], (last + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+        new_close = new_close[new_close.index > last]
+        # buang bar hari ini jika pasar (WIB) belum tutup, supaya tidak memakai harga intraday
+        now = pd.Timestamp.now(tz="Asia/Jakarta")
+        if len(new_close) and new_close.index[-1].date() == now.date() and now.hour * 60 + now.minute < 16 * 60 + 30:
+            new_close = new_close.iloc[:-1]
+        if new_close.empty:
+            return base, None
+        chain = pd.concat([base_close.iloc[-1:], new_close])
+        new_ret = np.log(chain / chain.shift(1)).dropna()
+        return pd.concat([base, new_ret]), None
+    except Exception as e:
+        return base, str(e)
+
+
+def predict_for_date(art, returns, target_date, model_name):
+    # Model satu langkah: memprediksi volatilitas satu hari perdagangan dari data SEBELUM hari itu.
+    c = art["config"]
+    td = pd.Timestamp(target_date)
+    on_or_after = returns.index[returns.index >= td]
+    if len(on_or_after) > 0:
+        eff = on_or_after[0]                      # hari perdagangan yang sudah punya data aktual
+        hist = returns[returns.index < eff]
+    else:
+        eff = None                                # tanggal setelah data terakhir: prakiraan murni
+        hist = returns
+        gap = (td - hist.index[-1]).days
+        if gap > 5:
+            raise ValueError(
+                f"Data terakhir yang tersedia {hist.index[-1].date()}. Model hanya memprediksi 1 hari perdagangan "
+                f"setelah data terakhir, jadi tanggal {td.date()} terlalu jauh."
+            )
+    if len(hist) < c["timestep"]:
+        raise ValueError(f"Tanggal terlalu awal: butuh minimal {c['timestep']} hari data sebelumnya.")
+    vol, var, cond = forecast_next(art, hist.values, model_name)
+    realized = returns.rolling(c["realized_vol_window"]).std()
+    out = {"eff": eff, "hist": hist, "cond": cond, "vol": vol, "var": var, "realized": realized}
+    if eff is not None:
+        out["actual_vol"] = float(realized.loc[eff])
+        out["actual_ret"] = float(returns.loc[eff])
+        out["in_sample"] = eff <= pd.Timestamp(c["train_end_date"])
+    return out
 
 
 def convergence(trials):
@@ -112,38 +157,74 @@ tab_pred, tab_test, tab_tbl, tab_search = st.tabs(
     ["Prediksi", "Evaluasi data test", "Tabel hasil", "Pencarian hyperparameter"]
 )
 
-# ---- Tab 1: prediksi hari berikutnya
+# ---- Tab 1: prediksi untuk tanggal tertentu
 with tab_pred:
-    model_name = st.selectbox("Model", names, index=default_i)
-    use_live = st.checkbox("Sertakan data terbaru dari yfinance", value=False)
+    cA, cB = st.columns([1, 1])
+    model_name = cA.selectbox("Model", names, index=default_i)
+    use_live = cB.checkbox("Pakai data terbaru dari yfinance", value=True)
 
-    returns = art["data"]["log_return"].copy()
-    if use_live:
-        try:
-            new_r = fetch_new_returns(art)
-            if len(new_r) > 0:
-                returns = pd.concat([returns, new_r])
-                st.info(f"Menambahkan {len(new_r)} hari data baru dari yfinance.")
-            else:
-                st.info("Tidak ada data baru setelah snapshot.")
-        except Exception as e:
-            st.warning(f"Gagal mengambil data yfinance, memakai snapshot saja. ({e})")
+    returns, live_err = build_returns(art, use_live)
+    if live_err:
+        st.warning(f"Gagal mengambil data yfinance, memakai snapshot saja. ({live_err})")
+    last_data = returns.index[-1].date()
+    today = pd.Timestamp.now(tz="Asia/Jakarta").date()
 
-    vol, var, cond = forecast_next(art, returns.values, model_name)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Tanggal data terakhir", str(returns.index[-1].date()))
-    m2.metric("Prediksi volatilitas harian (hari berikutnya)", f"{vol:.2%}")
-    m3.metric(f"VaR {conf_pct}% (1 hari)", f"{var:.2%}")
-
-    w = c["realized_vol_window"]
-    hist = pd.DataFrame({"Volatilitas kondisional GARCH": cond}, index=returns.index)
-    hist[f"Realized volatility ({w} hari)"] = returns.rolling(w).std()
-    st.line_chart(hist.tail(250))
-    st.caption(
-        "Target model adalah realized volatility (simpangan baku log return rolling). "
-        "VaR parametrik: asumsi distribusi normal dan mean return nol."
+    target = st.date_input(
+        "Tanggal yang ingin diprediksi",
+        value=today,
+        min_value=returns.index[c["timestep"]].date(),
     )
+    st.caption(f"Data tersedia sampai {last_data}.")
+
+    try:
+        res = predict_for_date(art, returns, target, model_name)
+    except ValueError as e:
+        st.error(str(e))
+        res = None
+
+    if res is not None:
+        w = c["realized_vol_window"]
+        if res["eff"] is None:
+            next_day = (pd.Timestamp(last_data) + pd.offsets.BDay(1)).date()  # hari kerja berikutnya (libur bursa tidak dikenali)
+            if target > next_day:
+                st.warning(
+                    f"Untuk memprediksi {target} dibutuhkan return hari sebelumnya yang belum tersedia "
+                    f"(data terakhir {last_data}). Hasil di bawah adalah prediksi untuk {next_day}, bukan {target}."
+                )
+            else:
+                st.info(f"Prakiraan murni untuk {next_day}, dihitung dari data sampai {last_data}.")
+            m1, m2 = st.columns(2)
+            m1.metric(f"Prediksi volatilitas {next_day}", f"{res['vol']:.2%}")
+            m2.metric(f"VaR {conf_pct}% (1 hari)", f"{res['var']:.2%}")
+        else:
+            eff = res["eff"]
+            if eff.date() != target:
+                st.info(f"{target} bukan hari perdagangan. Dipakai hari perdagangan berikutnya: {eff.date()}.")
+            if res["in_sample"]:
+                st.warning("Tanggal ini masuk data latih (in-sample). Hasil tidak bisa dipakai sebagai bukti performa model.")
+            else:
+                st.success("Tanggal ini di luar data latih (out-of-sample). Prediksi hanya memakai data sebelum tanggal tersebut.")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Prediksi volatilitas", f"{res['vol']:.2%}")
+            m2.metric(f"Realized volatility aktual ({w} hari)", f"{res['actual_vol']:.2%}")
+            m3.metric("Selisih (prediksi - aktual)", f"{res['vol'] - res['actual_vol']:+.2%}")
+            m4, m5 = st.columns(2)
+            m4.metric(f"VaR {conf_pct}% (1 hari)", f"{res['var']:.2%}")
+            m5.metric(
+                "Log return aktual",
+                f"{res['actual_ret']:.2%}",
+                delta="Melewati VaR (exceedance)" if res["actual_ret"] < res["var"] else "Di dalam VaR",
+                delta_color="off",
+            )
+
+        hist = pd.DataFrame({"Volatilitas kondisional GARCH": res["cond"]}, index=res["hist"].index)
+        hist[f"Realized volatility ({w} hari)"] = res["realized"].reindex(res["hist"].index)
+        st.line_chart(hist.tail(250))
+        st.caption(
+            "Target model adalah realized volatility (simpangan baku log return rolling). "
+            "VaR parametrik: asumsi distribusi normal dan mean return nol. "
+            "Parameter GARCH dan bobot model tetap dari data latih (tidak dilatih ulang)."
+        )
 
 # ---- Tab 2: evaluasi data test
 with tab_test:
