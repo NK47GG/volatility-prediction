@@ -14,6 +14,7 @@ from tensorflow.keras.optimizers import Adam
 
 PICKLE_PATH = "garch_lstm_lq45.pkl"
 MAX_H = 250                                   # horizon maksimal prakiraan (hari kerja)
+OUTLOOK_VER = 2   # naikkan tiap kali kolom/format hasil make_outlook berubah, supaya session_state lama tidak dipakai
 CSV_PATH = Path(__file__).parent / "harga_terbaru.csv"   # cadangan bila yfinance diblokir (dibuat dari notebook)
 
 st.set_page_config(page_title="Prediksi Volatilitas LQ45 (GARCH-LSTM)", layout="wide")
@@ -305,14 +306,14 @@ with tab_pred:
                 m2.metric(f"VaR {conf_pct}% (1 hari)", f"{res['var']:.2%}")
             else:
                 # tanggal lebih jauh dari hari kerja berikutnya: simulasi GARCH + LSTM sampai tanggal itu
-                start_d = returns.index[-1] + pd.Timedelta(days=1)
+                start_d = returns.index[-1] + pd.offsets.Day(1)
                 bd = pd.bdate_range(start_d, pd.Timestamp(target))
                 n_days = len(bd) + (1 if bd[-1].date() < target else 0)   # target akhir pekan: pakai hari kerja berikutnya
                 eff_f = pd.bdate_range(start_d, periods=n_days)[-1]
                 if n_days > MAX_H:
                     st.error(f"Tanggal terlalu jauh. Horizon maksimal {MAX_H} hari kerja (sekitar 1 tahun).")
                 else:
-                    key1 = (model_name, str(eff_f.date()), str(returns.index[-1]))
+                    key1 = (OUTLOOK_VER, model_name, str(eff_f.date()), str(returns.index[-1]))
                     if st.session_state.get("single_outlook", (None, None))[0] != key1:
                         with st.spinner("Menyimulasikan jalur return dan memprediksi dengan LSTM..."):
                             st.session_state["single_outlook"] = (key1, make_outlook(art, returns, n_days, 500, model_name))
@@ -389,7 +390,7 @@ with tab_fc:
     if horizon > MAX_H:
         st.error(f"Horizon maksimal {MAX_H} hari kerja (sekitar 1 tahun).")
     else:
-        key = (fc_model, str(end_date), n_sims, str(last_known))
+        key = (OUTLOOK_VER, fc_model, str(end_date), n_sims, str(last_known))
         if st.button("Hitung prakiraan", key="fc_btn"):
             with st.spinner("Menyimulasikan jalur return dan memprediksi dengan LSTM..."):
                 st.session_state["outlook"] = (key, make_outlook(art, returns, horizon, n_sims, fc_model))
