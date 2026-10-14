@@ -14,7 +14,7 @@ from tensorflow.keras.optimizers import Adam
 
 PICKLE_PATH = "garch_lstm_lq45.pkl"
 MAX_H = 250                                   # horizon maksimal prakiraan (hari kerja)
-OUTLOOK_VER = 2   # naikkan tiap kali kolom/format hasil make_outlook berubah, supaya session_state lama tidak dipakai
+OUTLOOK_VER = 3   # naikkan tiap kali kolom/format hasil make_outlook berubah, supaya session_state lama tidak dipakai
 CSV_PATH = Path(__file__).parent / "harga_terbaru.csv"   # cadangan bila yfinance diblokir (dibuat dari notebook)
 
 st.set_page_config(page_title="Prediksi Volatilitas LQ45 (GARCH-LSTM)", layout="wide")
@@ -240,12 +240,15 @@ def make_outlook(art, returns, horizon, n_sims, model_name, seed=0):
     gp = garch_param_dict(art)
     persist = gp["alpha[1]"] + gp["beta[1]"]
     long_run = np.sqrt(gp["omega"] / (1 - persist)) / art["garch"]["returns_scale"] if persist < 1 else np.nan
+    z = norm.ppf(1 - art["config"]["confidence"])   # negatif, mis. -1.645 untuk 95%
     out = pd.DataFrame(
         {
-            "LSTM P5": p[0], "LSTM median": p[1], "LSTM P95": p[2],
-            "GARCH realized (median)": np.median(sim_real, axis=0),
+            "Model P5": p[0], "Model median": p[1], "Model P95": p[2],
+            "GARCH saja (median)": np.median(sim_real, axis=0),
             "GARCH std kondisional": np.sqrt((sim_vol ** 2).mean(axis=0)),
             "Vol jangka panjang GARCH": long_run,
+            # VaR 1 hari untuk tiap tanggal = z x volatilitas prediksi (normal, mean nol)
+            "VaR (vol P5)": z * p[0], "VaR (vol median)": z * p[1], "VaR (vol P95)": z * p[2],
         },
         index=dates,
     )
@@ -328,10 +331,10 @@ with tab_pred:
                     if (today - last_data).days > 4:
                         st.warning(f"Data harga terakhir {last_data}. Hari setelahnya ikut disimulasikan, bukan data aktual.")
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric(f"LSTM median ({eff_f.date()})", f"{row['LSTM median']:.2%}")
-                    m2.metric("Rentang P5 sampai P95", f"{row['LSTM P5']:.2%} sampai {row['LSTM P95']:.2%}")
-                    m3.metric("GARCH realized (median)", f"{row['GARCH realized (median)']:.2%}")
-                    m4.metric(f"VaR {conf_pct}% dari median", f"{norm.ppf(1 - c['confidence']) * row['LSTM median']:.2%}")
+                    m1.metric(f"Model median ({eff_f.date()})", f"{row['Model median']:.2%}")
+                    m2.metric("Rentang P5 sampai P95", f"{row['Model P5']:.2%} sampai {row['Model P95']:.2%}")
+                    m3.metric("GARCH saja (median)", f"{row['GARCH saja (median)']:.2%}")
+                    m4.metric(f"VaR {conf_pct}% dari median", f"{row['VaR (vol median)']:.2%}")
                     st.caption(
                         f"Makin jauh tanggalnya, prakiraan makin mendekati volatilitas jangka panjang "
                         f"({row['Vol jangka panjang GARCH']:.2%}). Rentang P5 sampai P95 adalah sebaran antar jalur simulasi, "
@@ -401,11 +404,20 @@ with tab_fc:
             df_fc, persist, half_life = stored[1]
             last_row = df_fc.iloc[-1]
             k1, k2, k3, k4 = st.columns(4)
-            k1.metric(f"LSTM median ({df_fc.index[-1].date()})", f"{last_row['LSTM median']:.2%}")
-            k2.metric("Rentang P5 sampai P95", f"{last_row['LSTM P5']:.2%} sampai {last_row['LSTM P95']:.2%}")
-            k3.metric("GARCH realized (median)", f"{last_row['GARCH realized (median)']:.2%}")
+            k1.metric(f"Model median ({df_fc.index[-1].date()})", f"{last_row['Model median']:.2%}")
+            k2.metric("Rentang P5 sampai P95", f"{last_row['Model P5']:.2%} sampai {last_row['Model P95']:.2%}")
+            k3.metric("GARCH saja (median)", f"{last_row['GARCH saja (median)']:.2%}")
             k4.metric("Vol jangka panjang", f"{last_row['Vol jangka panjang GARCH']:.2%}")
-            st.line_chart(df_fc)
+            v1, v2, v3 = st.columns(3)
+            v1.metric(f"VaR {conf_pct}% dari median ({df_fc.index[-1].date()})", f"{last_row['VaR (vol median)']:.2%}")
+            v2.metric(f"VaR {conf_pct}% skenario buruk (vol P95)", f"{last_row['VaR (vol P95)']:.2%}")
+            v3.metric(f"VaR {conf_pct}% skenario tenang (vol P5)", f"{last_row['VaR (vol P5)']:.2%}")
+            vol_cols = [col for col in df_fc.columns if not col.startswith("VaR")]
+            var_cols = [col for col in df_fc.columns if col.startswith("VaR")]
+            st.subheader("Volatilitas harian")
+            st.line_chart(df_fc[vol_cols])
+            st.subheader(f"VaR {conf_pct}% per hari")
+            st.line_chart(df_fc[var_cols])
             st.dataframe(df_fc.apply(lambda col: col.map(lambda x: f"{x:.2%}")))
             export = (df_fc * 100).round(4)
             export.columns = [f"{col} (%)" for col in export.columns]
@@ -417,8 +429,13 @@ with tab_fc:
             st.caption(
                 "Cara membaca: LSTM memprediksi **realized volatility** (std 5 hari), yang secara rata-rata sekitar 8 sampai 10% "
                 "lebih rendah dari std kondisional GARCH dan volatilitas jangka panjang (keduanya berskala sigma). "
-                "Pembanding yang setara dengan LSTM adalah kolom **GARCH realized (median)**. Hari pertama tidak punya rentang "
+                "Pembanding yang setara dengan model adalah kolom **GARCH saja (median)**. Hari pertama tidak punya rentang "
                 "karena semua jalur memakai data nyata yang sama."
+            )
+            st.caption(
+                f"VaR {conf_pct}% adalah batas rugi 1 hari untuk tanggal tersebut (bukan rugi kumulatif), "
+                "dihitung dari volatilitas prediksi dengan asumsi distribusi normal dan mean nol. "
+                "Angkanya negatif. VaR (vol P95) adalah skenario terburuk, VaR (vol P5) skenario paling tenang."
             )
             st.caption(
                 f"Persistensi GARCH (alpha+beta) = {persist:.3f}"
