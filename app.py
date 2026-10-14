@@ -191,16 +191,18 @@ def garch_param_dict(art):
 def simulate_volatility(art, hist_returns, horizon, n_sims, entry, predict_fn, seed=0):
     # Prakiraan multi-hari: simulasikan jalur return dari GARCH, hitung fitur tiap jalur
     # ([log_return, conditional_volatility]), lalu prediksi realized volatility tiap hari dengan LSTM.
-    # Return: (vol_lstm [n_sims, horizon], vol_garch_sim [n_sims, horizon]) dalam skala asli (std harian).
+    # Return: (vol_lstm, vol_garch_kondisional, realized_vol_simulasi), tiap [n_sims, horizon], skala asli (std harian).
     c, g = art["config"], art["garch"]
     sc, T = g["returns_scale"], c["timestep"]
     r = np.asarray(hist_returns, dtype=float).ravel()
     gm = arch_model(pd.Series(r * sc), vol="GARCH", p=1, q=1, dist="normal").fix(g["params"])
     cond = np.asarray(gm.conditional_volatility) / sc
     rs = np.random.RandomState(seed)                  # rng eksplisit agar hasil reproducible (random_state diabaikan arch)
+    # Selalu menarik 250 kolom lalu dipotong: guncangan hari ke-k sama persis berapa pun horizonnya,
+    # jadi tanggal yang sama menghasilkan angka yang sama di prakiraan 1 minggu maupun 1 bulan.
     fc = gm.forecast(
         horizon=horizon, start=len(r) - 1, method="simulation", simulations=n_sims,
-        reindex=False, rng=lambda size: rs.standard_normal(size),
+        reindex=False, rng=lambda size: rs.standard_normal((size[0], max(size[1], 250)))[:, : size[1]],
     )
     sim_ret = fc.simulations.values[-1] / sc
     sim_vol = np.sqrt(fc.simulations.variances[-1]) / sc
@@ -217,14 +219,18 @@ def simulate_volatility(art, hist_returns, horizon, n_sims, entry, predict_fn, s
     dummy = np.zeros((len(pred_scaled), len(c["features"]) + 1))
     dummy[:, c["target_col_idx"]] = pred_scaled
     vol = art["scaler"].inverse_transform(dummy)[:, c["target_col_idx"]].reshape(n_sims, horizon)
-    return vol, sim_vol
+    # Realized volatility simulasi (std rolling return, definisi yang sama dengan target LSTM) sebagai pembanding setara
+    w = c["realized_vol_window"]
+    rets = np.concatenate([np.broadcast_to(r[-(w - 1):], (n_sims, w - 1)), sim_ret], axis=1)
+    sim_real = sliding_window_view(rets, w, axis=1).std(axis=-1, ddof=1)[:, :horizon]
+    return vol, sim_vol, sim_real
 # <<< FORECAST_UTILS
 
 
 def make_outlook(art, returns, horizon, n_sims, model_name, seed=0):
     entry = art["models"][model_name]
     model = get_model(model_name)
-    vol, sim_vol = simulate_volatility(
+    vol, sim_vol, sim_real = simulate_volatility(
         art, returns.values, horizon, n_sims, entry,
         lambda w: model.predict(w, verbose=0, batch_size=4096), seed,
     )
@@ -236,7 +242,8 @@ def make_outlook(art, returns, horizon, n_sims, model_name, seed=0):
     out = pd.DataFrame(
         {
             "LSTM P5": p[0], "LSTM median": p[1], "LSTM P95": p[2],
-            "GARCH saja": np.sqrt((sim_vol ** 2).mean(axis=0)),
+            "GARCH realized (median)": np.median(sim_real, axis=0),
+            "GARCH std kondisional": np.sqrt((sim_vol ** 2).mean(axis=0)),
             "Vol jangka panjang GARCH": long_run,
         },
         index=dates,
@@ -308,7 +315,7 @@ with tab_pred:
                     key1 = (model_name, str(eff_f.date()), str(returns.index[-1]))
                     if st.session_state.get("single_outlook", (None, None))[0] != key1:
                         with st.spinner("Menyimulasikan jalur return dan memprediksi dengan LSTM..."):
-                            st.session_state["single_outlook"] = (key1, make_outlook(art, returns, n_days, 300, model_name))
+                            st.session_state["single_outlook"] = (key1, make_outlook(art, returns, n_days, 500, model_name))
                     df_f, persist_f, half_f = st.session_state["single_outlook"][1]
                     row = df_f.iloc[-1]
                     if eff_f.date() != target:
@@ -322,7 +329,7 @@ with tab_pred:
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric(f"LSTM median ({eff_f.date()})", f"{row['LSTM median']:.2%}")
                     m2.metric("Rentang P5 sampai P95", f"{row['LSTM P5']:.2%} sampai {row['LSTM P95']:.2%}")
-                    m3.metric("GARCH saja", f"{row['GARCH saja']:.2%}")
+                    m3.metric("GARCH realized (median)", f"{row['GARCH realized (median)']:.2%}")
                     m4.metric(f"VaR {conf_pct}% dari median", f"{norm.ppf(1 - c['confidence']) * row['LSTM median']:.2%}")
                     st.caption(
                         f"Makin jauh tanggalnya, prakiraan makin mendekati volatilitas jangka panjang "
@@ -371,7 +378,7 @@ with tab_fc:
         min_value=first_day,
         key="fc_end",
     )
-    n_sims = f3.slider("Jumlah simulasi", 100, 1000, 300, 100, key="fc_sims")
+    n_sims = f3.slider("Jumlah simulasi", 100, 1000, 500, 100, key="fc_sims")
 
     horizon = len(pd.bdate_range(last_known + pd.Timedelta(days=1), pd.Timestamp(end_date)))
     st.caption(f"Data tersedia sampai {last_data}. Horizon: {horizon} hari kerja ({first_day} sampai {end_date}).")
@@ -395,12 +402,22 @@ with tab_fc:
             k1, k2, k3, k4 = st.columns(4)
             k1.metric(f"LSTM median ({df_fc.index[-1].date()})", f"{last_row['LSTM median']:.2%}")
             k2.metric("Rentang P5 sampai P95", f"{last_row['LSTM P5']:.2%} sampai {last_row['LSTM P95']:.2%}")
-            k3.metric("GARCH saja", f"{last_row['GARCH saja']:.2%}")
+            k3.metric("GARCH realized (median)", f"{last_row['GARCH realized (median)']:.2%}")
             k4.metric("Vol jangka panjang", f"{last_row['Vol jangka panjang GARCH']:.2%}")
             st.line_chart(df_fc)
             st.dataframe(df_fc.apply(lambda col: col.map(lambda x: f"{x:.2%}")))
+            export = (df_fc * 100).round(4)
+            export.columns = [f"{col} (%)" for col in export.columns]
+            export.index = export.index.strftime("%Y-%m-%d")
+            export.index.name = "Tanggal"
             st.download_button(
-                "Unduh CSV", df_fc.to_csv().encode("utf-8"), file_name="prakiraan_volatilitas.csv", mime="text/csv"
+                "Unduh CSV", export.to_csv().encode("utf-8"), file_name="prakiraan_volatilitas.csv", mime="text/csv"
+            )
+            st.caption(
+                "Cara membaca: LSTM memprediksi **realized volatility** (std 5 hari), yang secara rata-rata sekitar 8 sampai 10% "
+                "lebih rendah dari std kondisional GARCH dan volatilitas jangka panjang (keduanya berskala sigma). "
+                "Pembanding yang setara dengan LSTM adalah kolom **GARCH realized (median)**. Hari pertama tidak punya rentang "
+                "karena semua jalur memakai data nyata yang sama."
             )
             st.caption(
                 f"Persistensi GARCH (alpha+beta) = {persist:.3f}"
