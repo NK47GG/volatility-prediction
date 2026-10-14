@@ -13,6 +13,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 
 PICKLE_PATH = "garch_lstm_lq45.pkl"
+MAX_H = 250                                   # horizon maksimal prakiraan (hari kerja)
 CSV_PATH = Path(__file__).parent / "harga_terbaru.csv"   # cadangan bila yfinance diblokir (dibuat dari notebook)
 
 st.set_page_config(page_title="Prediksi Volatilitas LQ45 (GARCH-LSTM)", layout="wide")
@@ -158,13 +159,6 @@ def predict_for_date(art, returns, target_date, model_name):
     else:
         eff = None                                # tanggal setelah data terakhir: prakiraan murni
         hist = returns
-        gap = (td - hist.index[-1]).days
-        if gap > 5:
-            raise ValueError(
-                f"Data harga terakhir yang termuat: {hist.index[-1].date()}. Model memprediksi 1 hari perdagangan dari "
-                f"return hari sebelumnya, jadi untuk tanggal {td.date()} dibutuhkan data harga sampai hari sebelum tanggal itu. "
-                f"Pastikan data terbaru termuat (centang yfinance atau perbarui harga_terbaru.csv)."
-            )
     if len(hist) < c["timestep"]:
         raise ValueError(f"Tanggal terlalu awal: butuh minimal {c['timestep']} hari data sebelumnya.")
     vol, var, cond = forecast_next(art, hist.values, model_name)
@@ -297,16 +291,44 @@ with tab_pred:
         w = c["realized_vol_window"]
         if res["eff"] is None:
             next_day = (pd.Timestamp(last_data) + pd.offsets.BDay(1)).date()  # hari kerja berikutnya (libur bursa tidak dikenali)
-            if target > next_day:
-                st.warning(
-                    f"Untuk memprediksi {target} dibutuhkan return hari sebelumnya yang belum tersedia "
-                    f"(data terakhir {last_data}). Hasil di bawah adalah prediksi untuk {next_day}, bukan {target}."
-                )
+            if target <= next_day:
+                st.info(f"Prakiraan 1 langkah untuk {next_day}, dihitung dari data sampai {last_data}.")
+                m1, m2 = st.columns(2)
+                m1.metric(f"Prediksi volatilitas {next_day}", f"{res['vol']:.2%}")
+                m2.metric(f"VaR {conf_pct}% (1 hari)", f"{res['var']:.2%}")
             else:
-                st.info(f"Prakiraan murni untuk {next_day}, dihitung dari data sampai {last_data}.")
-            m1, m2 = st.columns(2)
-            m1.metric(f"Prediksi volatilitas {next_day}", f"{res['vol']:.2%}")
-            m2.metric(f"VaR {conf_pct}% (1 hari)", f"{res['var']:.2%}")
+                # tanggal lebih jauh dari hari kerja berikutnya: simulasi GARCH + LSTM sampai tanggal itu
+                start_d = returns.index[-1] + pd.Timedelta(days=1)
+                bd = pd.bdate_range(start_d, pd.Timestamp(target))
+                n_days = len(bd) + (1 if bd[-1].date() < target else 0)   # target akhir pekan: pakai hari kerja berikutnya
+                eff_f = pd.bdate_range(start_d, periods=n_days)[-1]
+                if n_days > MAX_H:
+                    st.error(f"Tanggal terlalu jauh. Horizon maksimal {MAX_H} hari kerja (sekitar 1 tahun).")
+                else:
+                    key1 = (model_name, str(eff_f.date()), str(returns.index[-1]))
+                    if st.session_state.get("single_outlook", (None, None))[0] != key1:
+                        with st.spinner("Menyimulasikan jalur return dan memprediksi dengan LSTM..."):
+                            st.session_state["single_outlook"] = (key1, make_outlook(art, returns, n_days, 300, model_name))
+                    df_f, persist_f, half_f = st.session_state["single_outlook"][1]
+                    row = df_f.iloc[-1]
+                    if eff_f.date() != target:
+                        st.info(f"{target} bukan hari kerja. Dipakai hari kerja berikutnya: {eff_f.date()}.")
+                    st.info(
+                        f"Prakiraan {n_days} hari kerja ke depan (dari data sampai {last_data}) lewat simulasi "
+                        f"GARCH + LSTM, nilai untuk {eff_f.date()}."
+                    )
+                    if (today - last_data).days > 4:
+                        st.warning(f"Data harga terakhir {last_data}. Hari setelahnya ikut disimulasikan, bukan data aktual.")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric(f"LSTM median ({eff_f.date()})", f"{row['LSTM median']:.2%}")
+                    m2.metric("Rentang P5 sampai P95", f"{row['LSTM P5']:.2%} sampai {row['LSTM P95']:.2%}")
+                    m3.metric("GARCH saja", f"{row['GARCH saja']:.2%}")
+                    m4.metric(f"VaR {conf_pct}% dari median", f"{norm.ppf(1 - c['confidence']) * row['LSTM median']:.2%}")
+                    st.caption(
+                        f"Makin jauh tanggalnya, prakiraan makin mendekati volatilitas jangka panjang "
+                        f"({row['Vol jangka panjang GARCH']:.2%}). Rentang P5 sampai P95 adalah sebaran antar jalur simulasi, "
+                        "bukan interval kepercayaan error model. Grafik lengkap ada di tab Prakiraan ke depan."
+                    )
         else:
             eff = res["eff"]
             if eff.date() != target:
@@ -339,7 +361,6 @@ with tab_pred:
 
 # ---- Tab 2: prakiraan beberapa hari ke depan
 with tab_fc:
-    MAX_H = 250
     last_known = returns.index[-1]
     first_day = (last_known + pd.offsets.BDay(1)).date()
     f1, f2, f3 = st.columns(3)
