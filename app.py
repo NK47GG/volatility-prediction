@@ -331,11 +331,12 @@ with tab_pred:
                     if (today - last_data).days > 4:
                         st.warning(f"Data harga terakhir {last_data}. Hari setelahnya ikut disimulasikan, bukan data aktual.")
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric(f"Model median ({eff_f.date()})", f"{row['Model median']:.2%}")
+                    m1.metric(f"Prediksi volatilitas, median ({eff_f.date()})", f"{row['Model median']:.2%}")
                     m2.metric("Rentang P5 sampai P95", f"{row['Model P5']:.2%} sampai {row['Model P95']:.2%}")
                     m3.metric("GARCH saja (median)", f"{row['GARCH saja (median)']:.2%}")
                     m4.metric(f"VaR {conf_pct}% dari median", f"{row['VaR (vol median)']:.2%}")
                     st.caption(
+                        "Prediksi volatilitas utama adalah **median** dari seluruh skenario simulasi. "
                         f"Makin jauh tanggalnya, prakiraan makin mendekati volatilitas jangka panjang "
                         f"({row['Vol jangka panjang GARCH']:.2%}). Rentang P5 sampai P95 adalah sebaran antar jalur simulasi, "
                         "bukan interval kepercayaan error model. Grafik lengkap ada di tab Prakiraan ke depan."
@@ -404,7 +405,7 @@ with tab_fc:
             df_fc, persist, half_life = stored[1]
             last_row = df_fc.iloc[-1]
             k1, k2, k3, k4 = st.columns(4)
-            k1.metric(f"Model median ({df_fc.index[-1].date()})", f"{last_row['Model median']:.2%}")
+            k1.metric(f"Prediksi volatilitas, median ({df_fc.index[-1].date()})", f"{last_row['Model median']:.2%}")
             k2.metric("Rentang P5 sampai P95", f"{last_row['Model P5']:.2%} sampai {last_row['Model P95']:.2%}")
             k3.metric("GARCH saja (median)", f"{last_row['GARCH saja (median)']:.2%}")
             k4.metric("Vol jangka panjang", f"{last_row['Vol jangka panjang GARCH']:.2%}")
