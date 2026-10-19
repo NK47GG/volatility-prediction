@@ -55,37 +55,46 @@ def load_csv_close():
 @st.cache_data(ttl=3600)
 def load_yf_close(ticker, start):
     import yfinance as yf
+    empty = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     raw = yf.download(ticker, start=start, auto_adjust=True, progress=False)
     if raw is None or raw.empty:
-        return pd.Series(dtype=float)
+        return empty
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
-    s = raw["Close"].dropna()
-    s.index = pd.to_datetime(s.index).tz_localize(None)
-    return s
+    s = raw["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.index = pd.DatetimeIndex(pd.to_datetime(s.index)).tz_localize(None)
+    return s.astype(float)
 
 
 def build_close_series(art, use_csv, use_live):
     close = art["data"]["Close"].copy()
-    close.index = pd.to_datetime(close.index)
+    close.index = pd.DatetimeIndex(pd.to_datetime(close.index))
     sources = []
+
+    def append(s, label):
+        nonlocal close
+        if s is None or len(s) == 0:
+            return
+        s = s.copy()
+        s.index = pd.DatetimeIndex(pd.to_datetime(s.index))
+        s = s[s.index > close.index[-1]]
+        if len(s):
+            close = pd.concat([close, s])
+            sources.append(f"{label} s.d. {close.index[-1].date()}")
+
     if use_csv:
         try:
-            s = load_csv_close()
-            s = s[s.index > close.index[-1]]
-            if len(s):
-                close = pd.concat([close, s])
-                sources.append(f"harga_terbaru.csv s.d. {close.index[-1].date()}")
+            append(load_csv_close(), "harga_terbaru.csv")
         except Exception as ex:
             st.warning(f"CSV tidak terbaca: {ex}")
     if use_live:
         try:
-            s = load_yf_close(art["meta"]["ticker"],
-                              (close.index[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
-            s = s[s.index > close.index[-1]]
-            if len(s):
-                close = pd.concat([close, s])
-                sources.append(f"yfinance s.d. {close.index[-1].date()}")
+            append(load_yf_close(art["meta"]["ticker"],
+                                 (close.index[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")),
+                   "yfinance")
         except Exception as ex:
             st.warning(f"yfinance gagal: {ex}")
     return close[~close.index.duplicated(keep="last")].sort_index(), sources
