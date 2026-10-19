@@ -9,8 +9,8 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 
 PICKLE_PATH = "garch_lstm_lq45.pkl"
-CSV_PATH = "harga_terbaru.csv"   # atau URL raw GitHub bila app tidak di-deploy dari repo yang sama
-MAX_HORIZON = 30                 # hari bursa
+CSV_PATH = "harga_terbaru.csv"
+MAX_HORIZON = 30
 EXTREME_RET = 0.08
 
 st.set_page_config(page_title="Prediksi Volatilitas LQ45 (GARCH-LSTM)", layout="wide")
@@ -53,51 +53,16 @@ def load_csv_close():
 
 
 @st.cache_data(ttl=3600)
-def load_yf_close(ticker, start):
-    import yfinance as yf
-    empty = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
-    raw = yf.download(ticker, start=start, auto_adjust=True, progress=False)
-    if raw is None or raw.empty:
-        return empty
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    s = raw["Close"]
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    s = s.dropna()
-    s.index = pd.DatetimeIndex(pd.to_datetime(s.index)).tz_localize(None)
-    return s.astype(float)
-
-
-def build_close_series(art, use_csv, use_live):
-    close = art["data"]["Close"].copy()
+def build_close_series(_art):
+    close = _art["data"]["Close"].copy()
     close.index = pd.DatetimeIndex(pd.to_datetime(close.index))
-    sources = []
-
-    def append(s, label):
-        nonlocal close
-        if s is None or len(s) == 0:
-            return
-        s = s.copy()
+    try:
+        s = load_csv_close()
         s.index = pd.DatetimeIndex(pd.to_datetime(s.index))
-        s = s[s.index > close.index[-1]]
-        if len(s):
-            close = pd.concat([close, s])
-            sources.append(f"{label} s.d. {close.index[-1].date()}")
-
-    if use_csv:
-        try:
-            append(load_csv_close(), "harga_terbaru.csv")
-        except Exception as ex:
-            st.warning(f"CSV tidak terbaca: {ex}")
-    if use_live:
-        try:
-            append(load_yf_close(art["meta"]["ticker"],
-                                 (close.index[-1] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")),
-                   "yfinance")
-        except Exception as ex:
-            st.warning(f"yfinance gagal: {ex}")
-    return close[~close.index.duplicated(keep="last")].sort_index(), sources
+        close = pd.concat([close, s[s.index > close.index[-1]]])
+    except Exception as ex:
+        st.warning(f"harga_terbaru.csv tidak terbaca, memakai snapshot saja. ({ex})")
+    return close[~close.index.duplicated(keep="last")].sort_index()
 
 
 # ================================================================ inferensi
@@ -113,8 +78,6 @@ def forecast_horizon(art, log_returns, model_name, z, horizon):
     e = art["models"][model_name]
     ts = c["timestep"]
     r = np.asarray(log_returns, dtype=float).ravel()
-    if len(r) < ts:
-        raise ValueError(f"Butuh minimal {ts} hari data.")
 
     gm = arch_model(pd.Series(r * g["returns_scale"]), vol="GARCH", p=1, q=1,
                     dist="normal").fix(g["params"])
@@ -144,9 +107,8 @@ def forecast_horizon(art, log_returns, model_name, z, horizon):
 def convergence(trials):
     tr = trials.sort_values("number")
     best = tr["value"].cummin().values
-    col = "user_attrs_train_sec" if "user_attrs_train_sec" in tr.columns else None
-    if col:
-        secs = tr[col].values
+    if "user_attrs_train_sec" in tr.columns:
+        secs = tr["user_attrs_train_sec"].values
     else:
         secs = pd.to_timedelta(tr["duration"]).dt.total_seconds().values
     return best, np.cumsum(secs) / 60
@@ -159,6 +121,19 @@ names = list(art["models"].keys())
 default_i = names.index(art["default_model"])
 conf_pct = int(round(c["confidence"] * 100))
 w = c["realized_vol_window"]
+
+# ---------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.header("Pengaturan")
+    model_name = st.selectbox("Model", names, index=default_i)
+    dist = st.radio("Distribusi VaR", ["normal", "empiris"], horizontal=True)
+    z = c["var_z"][dist]
+    st.divider()
+    close = build_close_series(art)
+    returns = np.log(close / close.shift(1)).dropna()
+    last_date = returns.index[-1]
+    st.caption(f"Data sampai **{last_date.date()}**  \nHarga terakhir **{close.iloc[-1]:,.2f}**")
+    st.caption(f"Timestep {c['timestep']} hari · {meta['n_runs']} run ensemble")
 
 st.title("Prediksi Volatilitas Indeks LQ45 (GARCH-LSTM + VU + Optuna)")
 st.caption(
@@ -173,98 +148,95 @@ tab_pred, tab_test, tab_tbl, tab_search = st.tabs(
 
 # ---------------------------------------------------------------- Tab 1
 with tab_pred:
-    col1, col2 = st.columns([2, 1])
-    model_name = col1.selectbox("Model", names, index=default_i)
-    dist = col2.radio("Distribusi VaR", ["normal", "empiris"], horizontal=True)
-    z = c["var_z"][dist]
-
-    cc1, cc2 = st.columns(2)
-    use_csv = cc1.checkbox("Pakai harga_terbaru.csv", value=True)
-    use_live = cc2.checkbox("Tambah data yfinance setelah CSV", value=False)
-
-    close, sources = build_close_series(art, use_csv, use_live)
-    returns = np.log(close / close.shift(1)).dropna()
-    last_date = returns.index[-1]
-
-    st.info("Sumber data tambahan: " + (", ".join(sources) if sources else "tidak ada, memakai snapshot saja"))
     stale = (pd.Timestamp.today().normalize() - last_date).days
     if stale > 7:
-        st.warning(f"Data terakhir {last_date.date()} sudah {stale} hari lalu. "
-                   "Perbarui harga_terbaru.csv agar prediksi untuk tanggal sekarang bermakna.")
+        st.warning(f"Data terakhir {last_date.date()} sudah {stale} hari lalu; "
+                   "prediksi untuk tanggal sekarang mungkin tidak bermakna.")
     recent = returns.tail(10)
     big = recent[recent.abs() > EXTREME_RET]
     if len(big):
-        st.warning("Return harian ekstrem pada " +
+        st.warning("Return harian ekstrem: " +
                    ", ".join(f"{d.date()} ({v:+.1%})" for d, v in big.items()) +
-                   ". Pastikan datanya benar; prediksi volatilitas akan sangat terpengaruh.")
+                   ". Pastikan datanya benar.")
 
     min_d = (last_date + pd.offsets.BDay(1)).date()
     max_d = (last_date + pd.offsets.BDay(MAX_HORIZON)).date()
-    target_date = st.date_input("Prediksi volatilitas untuk tanggal", value=min_d,
-                                min_value=min_d, max_value=max_d)
+    left, right = st.columns([1, 2])
+    with left:
+        target_date = st.date_input("Prediksi untuk tanggal", value=min_d,
+                                    min_value=min_d, max_value=max_d)
     fut_dates = pd.bdate_range(last_date, target_date)[1:]
-    if len(fut_dates) == 0:
-        st.error("Pilih tanggal setelah data terakhir.")
-        st.stop()
     horizon = len(fut_dates)
+    with right:
+        if horizon <= c["timestep"]:
+            st.success(f"Horizon {horizon} hari bursa — jendela input masih memuat data pasar nyata.")
+        else:
+            st.info(f"Horizon {horizon} hari bursa — melebihi timestep {c['timestep']}; "
+                    "seluruh input sudah berupa proyeksi GARCH, hasil mendekati volatilitas jangka panjang.")
 
     fc_df, cond = forecast_horizon(art, returns.values, model_name, z, horizon)
     fc_df.index = fut_dates
     last = fc_df.iloc[-1]
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Harga terakhir", f"{close.iloc[-1]:,.2f}", help=str(last_date.date()))
-    m2.metric("Horizon", f"{horizon} hari bursa")
-    m3.metric(f"Volatilitas harian {target_date}", f"{last['Volatilitas GARCH-LSTM']:.2%}",
+    st.markdown(f"### {target_date.strftime('%A, %d %B %Y')}")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Volatilitas harian (GARCH-LSTM)", f"{last['Volatilitas GARCH-LSTM']:.2%}",
               help=f"Rata-rata {meta['n_runs']} run; simpangan antar-run {last['Simpangan antar-run']:.2%}")
-    m4.metric(f"VaR {conf_pct}% 1 hari (z={z:.2f})", f"{last['VaR']:.2%}")
+    m2.metric("Volatilitas harian (GARCH saja)", f"{last['Volatilitas GARCH saja']:.2%}",
+              delta=f"{last['Volatilitas GARCH-LSTM'] - last['Volatilitas GARCH saja']:+.2%}",
+              delta_color="off")
+    m3.metric(f"VaR {conf_pct}% 1 hari", f"{last['VaR']:.2%}",
+              help=f"z = {z:.3f} ({dist}); potensi rugi harian terburuk pada tingkat keyakinan {conf_pct}%")
 
-    st.subheader("Lintasan ramalan sampai tanggal target")
-    st.line_chart(fc_df[["Volatilitas GARCH-LSTM", "Volatilitas GARCH saja"]])
-    st.dataframe(fc_df.style.format("{:.2%}"), use_container_width=True)
+    if horizon > 1:
+        st.subheader("Lintasan ramalan")
+        st.line_chart(fc_df[["Volatilitas GARCH-LSTM", "Volatilitas GARCH saja"]])
+        with st.expander("Tabel per hari"):
+            st.dataframe(fc_df.style.format("{:.2%}"), use_container_width=True)
 
-    st.subheader("Histori terakhir")
+    st.subheader("Setahun terakhir")
     hist = pd.DataFrame({"Volatilitas kondisional GARCH": cond}, index=returns.index)
     hist[f"Realized volatility ({w} hari)"] = returns.rolling(w).std()
     st.line_chart(hist.tail(250))
 
-    st.caption(
-        "Hari bursa dihitung Senin sampai Jumat; libur BEI belum dikecualikan. "
-        "Untuk horizon lebih dari 1 hari, return masa depan diasumsikan 0 dan volatilitas kondisional "
-        "memakai peramalan GARCH, sehingga prediksi mendekati GARCH murni dan makin tidak pasti. "
-        "Parameter GARCH dan scaler tetap dari data latih (tidak di-refit pada data baru)."
-    )
+    with st.expander("Catatan metodologi"):
+        st.markdown(
+            f"- Target: realized volatility {w} hari ({meta.get('target_mode', 'backward')}), "
+            f"input {c['timestep']} hari terakhir.\n"
+            "- Horizon > 1 hari dihitung rekursif: return masa depan diasumsikan 0, "
+            "volatilitas kondisional dari peramalan GARCH.\n"
+            "- Parameter GARCH dan scaler tetap dari data latih, tidak di-refit pada data baru.\n"
+            "- Hari bursa = Senin–Jumat; libur BEI belum dikecualikan."
+        )
 
 # ---------------------------------------------------------------- Tab 2
 with tab_test:
     t = art["test"]
     dates = pd.to_datetime(t["dates"])
     y_true = np.asarray(t["y_true"]).ravel()
-    model_eval = st.selectbox("Model", names, index=default_i, key="eval_model")
-
     pm = t["pred_mean"]
-    pred = np.asarray(pm[model_eval] if isinstance(pm, dict) else pm).ravel()
-    df_eval = pd.DataFrame({"Aktual": y_true, "Prediksi": pred}, index=dates)
-    st.line_chart(df_eval)
+    pred = np.asarray(pm[model_name] if isinstance(pm, dict) else pm).ravel()
+
+    st.subheader(f"{model_name} — data test")
+    st.line_chart(pd.DataFrame({"Aktual": y_true, "Prediksi": pred}, index=dates))
 
     err = pred - y_true
     e1, e2, e3 = st.columns(3)
     e1.metric("RMSE", f"{np.sqrt(np.mean(err ** 2)):.5f}")
     e2.metric("MAE", f"{np.mean(np.abs(err)):.5f}")
-    e3.metric("Jumlah observasi test", f"{len(y_true)}")
+    e3.metric("Observasi test", f"{len(y_true)}")
 
     if "actual_returns" in t and "var" in t:
         v = t["var"]
-        if isinstance(v, dict) and model_eval in v:
-            v = v[model_eval]
+        if isinstance(v, dict) and model_name in v:
+            v = v[model_name]
         if isinstance(v, dict):
             v = v.get(dist, next(iter(v.values())))
         v = np.asarray(v).ravel()
         ar = np.asarray(t["actual_returns"]).ravel()
         if len(v) == len(ar):
-            df_var = pd.DataFrame({"Return aktual": ar, f"VaR {conf_pct}%": v}, index=dates)
             st.subheader(f"VaR {conf_pct}% vs return aktual")
-            st.line_chart(df_var)
+            st.line_chart(pd.DataFrame({"Return aktual": ar, f"VaR {conf_pct}%": v}, index=dates))
             st.caption(f"Pelanggaran: {(ar < v).sum()} dari {len(ar)} "
                        f"(diharapkan {(1 - c['confidence']) * len(ar):.1f})")
 
