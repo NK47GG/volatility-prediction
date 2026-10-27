@@ -1,26 +1,27 @@
 import pickle
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 from arch import arch_model
 
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 
 PICKLE_PATH = "garch_lstm_lq45.pkl"
+CSV_PATH = "harga_terbaru.csv"
+MAX_HORIZON = 30
+EXTREME_RET = 0.08
 
-st.set_page_config(
-    page_title="LQ45 Volatility Forecasting Dashboard (GARCH-LSTM + Optuna)",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="LQ45 Volatility Forecasting (GARCH-LSTM)", layout="wide")
 
-# ---------------------------------------------------------------- Loader & Model Builder
+
+# ================================================================ loader & model
 @st.cache_resource
 def load_art():
     with open(PICKLE_PATH, "rb") as fh:
         return pickle.load(fh)
+
 
 def build_lstm(params, input_shape):
     model = Sequential([Input(shape=input_shape)])
@@ -30,9 +31,9 @@ def build_lstm(params, input_shape):
     model.add(Dense(1))
     return model
 
+
 @st.cache_resource
 def get_models(name):
-    """Ensemble across all trained runs (consistent with N_RUNS ensemble evaluation)."""
     art = load_art()
     e = art["models"][name]
     shape = (art["config"]["timestep"], len(e["features"]))
@@ -43,55 +44,77 @@ def get_models(name):
         models.append(m)
     return models
 
-# ---------------------------------------------------------------- Inference Engine
+
+# ================================================================ data
+@st.cache_data(ttl=3600)
+def load_csv_close():
+    df = pd.read_csv(CSV_PATH, parse_dates=["Date"])
+    return pd.Series(df["Close"].values, index=df["Date"]).sort_index().dropna()
+
+
+@st.cache_data(ttl=3600)
+def build_close_series(_art):
+    close = _art["data"]["Close"].copy()
+    close.index = pd.DatetimeIndex(pd.to_datetime(close.index))
+    try:
+        s = load_csv_close()
+        s.index = pd.DatetimeIndex(pd.to_datetime(s.index))
+        close = pd.concat([close, s[s.index > close.index[-1]]])
+    except Exception as ex:
+        st.warning(f"Could not read {CSV_PATH}, using snapshot only. ({ex})")
+    return close[~close.index.duplicated(keep="last")].sort_index()
+
+
+# ================================================================ inference
 def to_orig(art, pred_scaled):
     c = art["config"]
     dummy = np.zeros((len(pred_scaled), len(c["features"]) + 1))
     dummy[:, c["target_col_idx"]] = pred_scaled
     return art["scaler"].inverse_transform(dummy)[:, c["target_col_idx"]]
 
-def forecast_next(art, log_returns, model_name, z):
+
+def forecast_horizon(art, log_returns, model_name, z, horizon):
     c, g = art["config"], art["garch"]
     e = art["models"][model_name]
+    ts = c["timestep"]
     r = np.asarray(log_returns, dtype=float).ravel()
-    if len(r) < c["timestep"]:
-        raise ValueError(f"Requires at least {c['timestep']} trading days of historical return data.")
-    gm = arch_model(pd.Series(r * g["returns_scale"]), vol="GARCH", p=1, q=1, dist="normal").fix(g["params"])
-    cond = np.asarray(gm.conditional_volatility) / g["returns_scale"]
-    feats = np.column_stack([r, cond, np.zeros(len(r))])  # 3rd column placeholder for target
+
+    gm = arch_model(pd.Series(r * g["returns_scale"]), vol="GARCH", p=1, q=1,
+                    dist="normal").fix(g["params"])
+    cond_hist = np.asarray(gm.conditional_volatility) / g["returns_scale"]
+    fc = gm.forecast(horizon=horizon, reindex=False)
+    cond_fut = np.sqrt(fc.variance.values[-1]) / g["returns_scale"]
+
+    r_ext = np.concatenate([r, np.zeros(horizon)])
+    cond_ext = np.concatenate([cond_hist, cond_fut])
+    feats = np.column_stack([r_ext, cond_ext, np.zeros(len(r_ext))])
     scaled = art["scaler"].transform(feats)[:, : len(c["features"])]
-    X_new = scaled[-c["timestep"]:][None, :, :][:, :, e["features"]]
-    preds = np.array([m.predict(X_new, verbose=0).ravel()[0] for m in get_models(model_name)])
-    vol_runs = to_orig(art, preds)
-    vol = float(vol_runs.mean())
-    return vol, float(z * vol), cond, float(vol_runs.std())
 
-def fetch_new_returns(art):
-    import yfinance as yf
+    models = get_models(model_name)
+    rows = []
+    for h in range(1, horizon + 1):
+        end = len(r) + h - 1
+        X = scaled[end - ts:end][None, :, :][:, :, e["features"]]
+        p = np.array([m.predict(X, verbose=0).ravel()[0] for m in models])
+        vols = to_orig(art, p)
+        rows.append({"GARCH-LSTM Volatility": vols.mean(),
+                     "Inter-run Std": vols.std(),
+                     "VaR": z * vols.mean(),
+                     "GARCH-only Volatility": cond_fut[h - 1]})
+    return pd.DataFrame(rows), cond_hist
 
-    base_close = art["data"]["Close"]
-    last_date = base_close.index[-1]
-    start = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    raw = yf.download(art["meta"]["ticker"], start=start, auto_adjust=True, progress=False)
-    if raw is None or raw.empty:
-        return pd.Series(dtype=float)
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    new_close = raw["Close"].dropna()
-    new_close = new_close[new_close.index > last_date]
-    if new_close.empty:
-        return pd.Series(dtype=float)
-    chain = pd.concat([base_close.iloc[-1:], new_close])
-    return np.log(chain / chain.shift(1)).dropna()
 
 def convergence(trials):
     tr = trials.sort_values("number")
     best = tr["value"].cummin().values
-    col = "user_attrs_train_sec" if "user_attrs_train_sec" in tr.columns else None
-    secs = tr[col].values if col else tr["duration"].dt.total_seconds().values
+    if "user_attrs_train_sec" in tr.columns:
+        secs = tr["user_attrs_train_sec"].values
+    else:
+        secs = pd.to_timedelta(tr["duration"]).dt.total_seconds().values
     return best, np.cumsum(secs) / 60
 
-# ---------------------------------------------------------------- UI Presentation
+
+# ================================================================ UI
 art = load_art()
 c, meta = art["config"], art["meta"]
 names = list(art["models"].keys())
@@ -99,127 +122,158 @@ default_i = names.index(art["default_model"])
 conf_pct = int(round(c["confidence"] * 100))
 w = c["realized_vol_window"]
 
-st.title("LQ45 Stock Index Volatility Forecasting Dashboard")
+# Auto-detect VaR quantile keys ("Normal"/"Empirical" in v8 vs "normal"/"empiris" in older pkl)
+var_keys = list(c["var_z"].keys())
+dist_labels = ["Normal" if k.lower().startswith("norm") else "Empirical" for k in var_keys]
+dist_map = dict(zip(dist_labels, var_keys))
+
+# ---------------------------------------------------------------- sidebar
+with st.sidebar:
+    st.header("Settings")
+    model_name = st.selectbox("Model", names, index=default_i)
+    dist_label = st.radio("VaR Distribution", dist_labels, horizontal=True)
+    dist = dist_map[dist_label]
+    z = c["var_z"][dist]
+    st.divider()
+    close = build_close_series(art)
+    returns = np.log(close / close.shift(1)).dropna()
+    last_date = returns.index[-1]
+    st.caption(f"Data up to **{last_date.date()}**  \nLatest Close **{close.iloc[-1]:,.2f}**")
+    st.caption(f"Timestep {c['timestep']} days · {meta['n_runs']}-run ensemble")
+
+st.title("LQ45 Index Volatility Forecasting (GARCH-LSTM + VU + Optuna)")
 st.caption(
-    f"Index Benchmark: {meta['ticker']} ({meta['start']} to {meta['end']}) | "
-    f"Training Window up to: {c['train_end_date']} | "
-    f"Target: {w}-day Realized Volatility ({meta.get('target_mode', 'backward')}) | "
-    f"Model Export: {meta['created_at'][:10]}"
+    f"Trained on {meta['ticker']} {meta['start']} to {meta['end']} "
+    f"(training data up to {c['train_end_date']}) | target: {w}-day realized volatility "
+    f"({meta.get('target_mode', 'backward')}) | exported {meta['created_at'][:10]}"
 )
 
 tab_pred, tab_test, tab_tbl, tab_search = st.tabs(
-    ["Next-Day Forecast", "Out-of-Sample Evaluation", "Performance Benchmark", "Hyperparameter Search"]
+    ["Forecast", "Test Set Evaluation", "Result Tables", "Hyperparameter Search"]
 )
 
-# ---- Tab 1: Next-Day Prediction
+# ---------------------------------------------------------------- Tab 1
 with tab_pred:
-    col1, col2 = st.columns([2, 1])
-    model_name = col1.selectbox("Model Architecture", names, index=default_i)
-    dist = col2.radio("VaR Quantile Assumption", ["Normal", "Empirical"], horizontal=True)
-    z = c["var_z"][dist]
-    use_live = st.checkbox("Fetch latest market data via Yahoo Finance", value=False)
+    stale = (pd.Timestamp.today().normalize() - last_date).days
+    if stale > 7:
+        st.warning(f"Latest data ({last_date.date()}) is {stale} days old; "
+                   "forecasts for current dates may be less informative.")
+    recent = returns.tail(10)
+    big = recent[recent.abs() > EXTREME_RET]
+    if len(big):
+        st.warning("Extreme daily returns detected: " +
+                   ", ".join(f"{d.date()} ({v:+.1%})" for d, v in big.items()) +
+                   ". Please verify data integrity.")
 
-    returns = art["data"]["log_return"].copy()
-    if use_live:
-        try:
-            new_r = fetch_new_returns(art)
-            if len(new_r) > 0:
-                returns = pd.concat([returns, new_r])
-                st.info(f"Appended {len(new_r)} days of live market returns. Pre-estimated GARCH parameters "
-                        f"and scalers remain fixed to training horizon ({c['train_end_date']}) to prevent look-ahead bias.")
-            else:
-                st.info("No new trading sessions detected beyond the current dataset snapshot.")
-        except Exception as ex:
-            st.warning(f"Failed to fetch live data from yfinance; reverting to offline snapshot. ({ex})")
+    min_d = (last_date + pd.offsets.BDay(1)).date()
+    max_d = (last_date + pd.offsets.BDay(MAX_HORIZON)).date()
+    left, right = st.columns([1, 2])
+    with left:
+        target_date = st.date_input("Forecast Target Date", value=min_d,
+                                    min_value=min_d, max_value=max_d)
+    fut_dates = pd.bdate_range(last_date, target_date)[1:]
+    horizon = len(fut_dates)
+    with right:
+        if horizon <= c["timestep"]:
+            st.success(f"Horizon: {horizon} trading days — input window still contains actual market observations.")
+        else:
+            st.info(f"Horizon: {horizon} trading days — exceeds {c['timestep']}-day timestep; "
+                    "inputs rely entirely on GARCH projections, converging toward long-run volatility.")
 
-    vol, var, cond, run_std = forecast_next(art, returns.values, model_name, z)
+    fc_df, cond = forecast_horizon(art, returns.values, model_name, z, horizon)
+    fc_df.index = fut_dates
+    last = fc_df.iloc[-1]
 
+    st.markdown(f"### {target_date.strftime('%A, %d %B %Y')}")
     m1, m2, m3 = st.columns(3)
-    m1.metric("Latest Trading Date", str(returns.index[-1].date()))
-    m2.metric("Forecasted Next-Day Volatility", f"{vol:.2%}",
-              help=f"Ensemble mean across {meta['n_runs']} independent runs; Run std: {run_std:.2%}")
-    m3.metric(f"Value-at-Risk ({conf_pct}%, z={z:.2f})", f"{var:.2%}")
+    m1.metric("Daily Volatility (GARCH-LSTM)", f"{last['GARCH-LSTM Volatility']:.2%}",
+              help=f"Mean across {meta['n_runs']} runs; inter-run std: {last['Inter-run Std']:.2%}")
+    m2.metric("Daily Volatility (GARCH only)", f"{last['GARCH-only Volatility']:.2%}",
+              delta=f"{last['GARCH-LSTM Volatility'] - last['GARCH-only Volatility']:+.2%}",
+              delta_color="off")
+    m3.metric(f"1-Day {conf_pct}% VaR", f"{last['VaR']:.2%}",
+              help=f"z = {z:.3f} ({dist_label}); worst expected daily loss at {conf_pct}% confidence level")
 
+    if horizon > 1:
+        st.subheader("Forecast Trajectory")
+        st.line_chart(fc_df[["GARCH-LSTM Volatility", "GARCH-only Volatility"]])
+        with st.expander("Daily Forecast Breakdown"):
+            st.dataframe(fc_df.style.format("{:.2%}"), use_container_width=True)
+
+    st.subheader("Past Year Historical Trajectory")
     hist = pd.DataFrame({"GARCH Conditional Volatility": cond}, index=returns.index)
-    hist[f"{w}-Day Realized Volatility"] = returns.rolling(w).std()
+    hist[f"Realized Volatility ({w}-day)"] = returns.rolling(w).std()
     st.line_chart(hist.tail(250))
-    st.caption("Parametric Value-at-Risk assumes zero-mean daily returns. Normal z represents Gaussian quantiles; "
-               "Empirical z is derived from standardized training residuals (capturing fat tails).")
 
-# ---- Tab 2: Out-of-Sample Test Evaluation
+    with st.expander("Methodological Notes"):
+        st.markdown(
+            f"- Target: {w}-day realized volatility ({meta.get('target_mode', 'backward')}), "
+            f"using the last {c['timestep']} trading days as input.\n"
+            "- Multi-step horizons (> 1 day) are computed recursively: future log returns are assumed 0, "
+            "while conditional volatility is driven by analytical GARCH projections.\n"
+            "- Pre-estimated GARCH parameters and MinMaxScaler remain fixed from the training core (no refitting on new data).\n"
+            "- Trading days follow Monday–Friday business calendar (IDX holidays not excluded)."
+        )
+
+# ---------------------------------------------------------------- Tab 2
 with tab_test:
     t = art["test"]
-    sel = st.multiselect("Selected Models for Comparison", names, default=[art["default_model"]])
-    plot_df = pd.DataFrame({"Actual Realized Volatility": t["y_true"]}, index=t["dates"])
-    for n in sel:
-        plot_df[n] = t["pred_mean"][n]
-    st.line_chart(plot_df)
-    st.caption(f"Forecasts reflect original-scale ensemble averages across {meta['n_runs']} runs.")
+    dates = pd.to_datetime(t["dates"])
+    y_true = np.asarray(t["y_true"]).ravel()
+    pm = t["pred_mean"]
+    pred = np.asarray(pm[model_name] if isinstance(pm, dict) else pm).ravel()
 
-    st.subheader("Value-at-Risk (VaR) vs. Actual Log Returns")
-    cva, cvb = st.columns([2, 1])
-    vm = cva.selectbox("Model for VaR Backtest Plot", names, index=default_i, key="var_model")
-    vd = cvb.radio("Quantile Distribution", ["Normal", "Empirical"], horizontal=True, key="var_dist")
-    var_s = np.asarray(t["var"][vm][vd])
-    ret = np.asarray(t["actual_returns"])
-    dates = pd.DatetimeIndex(t["dates"])
-    exc = ret < var_s
-    fig, ax = plt.subplots(figsize=(11, 4), dpi=150)
-    ax.plot(dates, ret, lw=0.8, color="#64748B", label="Actual Daily Log Returns")
-    ax.plot(dates, var_s, lw=1.2, color="#0284C7", label=f"95% VaR Threshold ({vd})")
-    ax.scatter(dates[exc], ret[exc], color="#DC2626", s=14, label=f"Exceedances ({int(exc.sum())})")
-    ax.set_ylabel("Daily Return / Risk Level", fontsize=9)
-    ax.legend(fontsize=8, loc="lower left")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
-    st.dataframe(art["tables"]["backtest"].reset_index(), use_container_width=True)
-    st.caption("Decision Rule: Kupiec POF and Christoffersen p-values > 0.05 indicate a statistically valid risk model.")
+    st.subheader(f"{model_name} — Out-of-Sample Test Set")
+    st.line_chart(pd.DataFrame({"Actual": y_true, "Predicted": pred}, index=dates))
 
-# ---- Tab 3: Performance Tables
+    err = pred - y_true
+    e1, e2, e3 = st.columns(3)
+    e1.metric("RMSE", f"{np.sqrt(np.mean(err ** 2)):.5f}")
+    e2.metric("MAE", f"{np.mean(np.abs(err)):.5f}")
+    e3.metric("Test Observations", f"{len(y_true)}")
+
+    if "actual_returns" in t and "var" in t:
+        v = t["var"]
+        if isinstance(v, dict) and model_name in v:
+            v = v[model_name]
+        if isinstance(v, dict):
+            v = v.get(dist, v.get(dist_label, next(iter(v.values()))))
+        v = np.asarray(v).ravel()
+        ar = np.asarray(t["actual_returns"]).ravel()
+        if len(v) == len(ar):
+            st.subheader(f"{conf_pct}% VaR vs. Actual Log Returns")
+            st.line_chart(pd.DataFrame({"Actual Return": ar, f"{conf_pct}% VaR": v}, index=dates))
+            st.caption(f"Violations: {(ar < v).sum()} out of {len(ar)} days "
+                       f"(Expected: {(1 - c['confidence']) * len(ar):.1f})")
+
+# ---------------------------------------------------------------- Tab 3
 with tab_tbl:
-    st.subheader("Table A. Out-of-Sample Model Accuracy Summary (Original Scale)")
-    st.dataframe(art["tables"]["results"], use_container_width=True)
-    
-    st.subheader("Table B. Pairwise Statistical Significance (Diebold-Mariano & Welch's t-test)")
-    st.dataframe(art["tables"]["significance"], use_container_width=True)
-    
-    st.subheader("Hyperparameter Search Computational Efficiency")
-    st.dataframe(art["tables"]["efficiency"], use_container_width=True)
-    
-    if "search_dist" in art["tables"]:
-        st.subheader("Multi-Seed Convergence Distribution (Optuna vs. Random Grid)")
-        st.dataframe(art["tables"]["search_dist"], use_container_width=True)
-        
-    st.subheader("Optimal Hyperparameter Sets per Architecture")
-    st.dataframe(pd.DataFrame({n: e["params"] for n, e in art["models"].items()}).T.astype(str), use_container_width=True)
+    tbl = art["tables"]
+    for key, title in [("results", "Model Evaluation Summary"),
+                       ("significance", "Diebold-Mariano & Welch Significance Tests"),
+                       ("efficiency", "Hyperparameter Search Efficiency"),
+                       ("search_dist", "Multi-Seed Convergence Distribution"),
+                       ("backtest", "Value-at-Risk (VaR) Backtesting")]:
+        if key in tbl:
+            st.subheader(title)
+            st.dataframe(tbl[key], use_container_width=True)
 
-# ---- Tab 4: Search Convergence Curves
+# ---------------------------------------------------------------- Tab 4
 with tab_search:
-    g_best, g_min = convergence(art["tables"]["trials_grid"])
-    o_best, o_min = convergence(art["tables"]["trials_optuna"])
-    fig2, axes = plt.subplots(1, 2, figsize=(13, 4), dpi=150)
-    axes[0].plot(np.arange(1, len(g_best) + 1), g_best, marker="o", markersize=3, color="tab:blue", label="Grid Search")
-    axes[0].plot(np.arange(1, len(o_best) + 1), o_best, marker="s", markersize=3, color="tab:orange", label="Optuna (TPE)")
-    axes[0].set_xlabel("Trial Number", fontsize=9)
-    axes[0].set_ylabel("Best Validation Score (MSE)", fontsize=9)
-    axes[0].set_title("Convergence vs. Trials", fontsize=10, fontweight="bold")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, linestyle=":", alpha=0.6)
-    
-    axes[1].plot(g_min, g_best, marker="o", markersize=3, color="tab:blue", label="Grid Search")
-    axes[1].plot(o_min, o_best, marker="o", markersize=3, color="tab:orange", label="Optuna (TPE)")
-    axes[1].set_xlabel("Cumulative Training Time (Minutes)", fontsize=9)
-    axes[1].set_ylabel("Best Validation Score (MSE)", fontsize=9)
-    axes[1].set_title("Convergence vs. Training Time", fontsize=10, fontweight="bold")
-    axes[1].legend(fontsize=8)
-    axes[1].grid(True, linestyle=":", alpha=0.6)
-    
-    fig2.tight_layout()
-    st.pyplot(fig2)
-    plt.close(fig2)
-    st.subheader("Hyperparameter Search Space Definition")
+    tbl = art["tables"]
+    if "trials_grid" in tbl and "trials_optuna" in tbl:
+        bg, tg = convergence(tbl["trials_grid"])
+        bo, to = convergence(tbl["trials_optuna"])
+        st.subheader("Best Validation Score Convergence vs. Training Time")
+        conv = pd.concat([
+            pd.DataFrame({"Grid Search": bg}, index=np.round(tg, 2)),
+            pd.DataFrame({"Optuna (TPE)": bo}, index=np.round(to, 2)),
+        ]).sort_index().ffill()
+        conv.index.name = "Minutes"
+        st.line_chart(conv)
+        st.subheader("Grid Search Trials")
+        st.dataframe(tbl["trials_grid"], use_container_width=True)
+        st.subheader("Optuna (TPE) Trials")
+        st.dataframe(tbl["trials_optuna"], use_container_width=True)
+    st.subheader("Hyperparameter Search Space")
     st.json(c["search_space"])
-
-st.divider()
-st.caption("Academic Research Project | Universitas Dian Nuswantoro | Benchmarked on IDX LQ45 Index.")
